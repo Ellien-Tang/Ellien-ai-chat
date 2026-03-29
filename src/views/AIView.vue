@@ -2,6 +2,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { ChatDotRound, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import MarkdownRenderer from '../components/MarkdownRenderer.vue'  // 引入 Markdown 组件
 
 // 对话消息列表
 const messages = ref([
@@ -81,7 +82,8 @@ const sendMessage = async () => {
       id: Date.now() + 1,
       role: 'assistant',
       content: '',
-      timestamp: new Date().toLocaleString()
+      timestamp: new Date().toLocaleString(),
+      isStreaming: true  // 标记正在流式输出
     }
     messages.value.push(aiReply)
     
@@ -90,7 +92,10 @@ const sendMessage = async () => {
 
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        aiReply.isStreaming = false  // 流式结束
+        break
+      }
 
       const chunk = decoder.decode(value, { stream: true })
       const lines = chunk.split('\n')
@@ -118,7 +123,6 @@ const sendMessage = async () => {
             }
           } catch (jsonError) {
             console.error('解析JSON错误:', jsonError)
-            // 发送错误通知
             ElMessage.error(`流式响应解析错误: ${jsonError.message}`)
           }
         }
@@ -151,7 +155,17 @@ onMounted(() => {
           message.role === 'assistant' ? 'ai-message' : 'user-message'
         ]"
       >
-        <div class="message-content">{{ message.content }}</div>
+        <!-- AI 消息使用 Markdown 渲染 -->
+        <div v-if="message.role === 'assistant'" class="message-content markdown-wrapper">
+          <MarkdownRenderer :content="message.content" />
+          <!-- 流式输出时的闪烁光标 -->
+          <span v-if="message.isStreaming" class="streaming-cursor">▊</span>
+        </div>
+        
+        <!-- 用户消息保持纯文本 -->
+        <div v-else class="message-content">
+          {{ message.content }}
+        </div>
       </div>
       
       <!-- 正在输入指示器 -->
@@ -167,8 +181,6 @@ onMounted(() => {
       </div>
     </div>
 
-
-    
     <!-- 输入区域 -->
     <div class="input-area">
       <el-input
@@ -301,7 +313,26 @@ onMounted(() => {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
+/* Markdown 容器样式 */
+.markdown-wrapper {
+  min-width: 200px;
+  max-width: 800px; /* Markdown 内容可以更宽一些 */
+}
 
+/* 流式输出闪烁光标 */
+.streaming-cursor {
+  display: inline-block;
+  color: #0284c7;
+  animation: blink 1s infinite;
+  margin-left: 4px;
+  font-size: 14px;
+  vertical-align: middle;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
 
 .input-area {
   padding: 20px;
