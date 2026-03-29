@@ -2,7 +2,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import { ChatDotRound, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import MarkdownRenderer from '../components/MarkdownRenderer.vue'  // 引入 Markdown 组件
+import MarkdownRenderer from '../components/MarkdownRenderer.vue'
 
 // 对话消息列表
 const messages = ref([
@@ -10,7 +10,8 @@ const messages = ref([
     id: 1,
     role: 'assistant',
     content: '你好！我是你的AI助手，有什么可以帮助你的吗？',
-    timestamp: new Date().toLocaleString()
+    timestamp: new Date().toLocaleString(),
+    isStreaming: false
   }
 ])
 
@@ -43,7 +44,8 @@ const sendMessage = async () => {
     id: Date.now(),
     role: 'user',
     content: inputMessage.value.trim(),
-    timestamp: new Date().toLocaleString()
+    timestamp: new Date().toLocaleString(),
+    isStreaming: false
   }
   messages.value.push(userMessage)
 
@@ -53,47 +55,51 @@ const sendMessage = async () => {
   // 开始生成回复
   isGenerating.value = true
 
-  try {
-    // 转换消息格式为OpenAI API所需的格式
-    const apiMessages = messages.value.map(msg => ({
-      role: msg.role,
-      content: msg.content
-    }))
+  // 转换消息格式为OpenAI API所需的格式
+  const apiMessages = messages.value.map(msg => ({
+    role: msg.role,
+    content: msg.content
+  }))
 
-    // 调用后端API
-    const response = await fetch('http://localhost:3000/api/chat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ 
-        messages: apiMessages
-      })
+  // 调用后端API
+  const response = await fetch('http://localhost:3000/api/chat', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ 
+      messages: apiMessages
     })
+  })
 
-    if (!response.ok) {
-      throw new Error('API请求失败')
-    }
-
-    // 处理流式响应
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let aiReply = {
-      id: Date.now() + 1,
-      role: 'assistant',
-      content: '',
-      timestamp: new Date().toLocaleString(),
-      isStreaming: true  // 标记正在流式输出
-    }
-    messages.value.push(aiReply)
-    
-    // 隐藏正在输入指示器
+  if (!response.ok) {
     isGenerating.value = false
+    ElMessage.error('API请求失败')
+    return
+  }
 
+  // 处理流式响应
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let aiReply = {
+    id: Date.now() + 1,
+    role: 'assistant',
+    content: '',
+    timestamp: new Date().toLocaleString(),
+    isStreaming: true  // 标记正在流式输出
+  }
+  messages.value.push(aiReply)
+  
+  // 隐藏正在输入指示器
+  isGenerating.value = false
+
+  try {
     while (true) {
       const { done, value } = await reader.read()
-      if (done) {
-        aiReply.isStreaming = false  // 流式结束
+      
+      // 流式结束：读取完成或没有数据
+      if (done || !value) {
+        aiReply.isStreaming = false
         break
       }
 
@@ -103,7 +109,12 @@ const sendMessage = async () => {
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           const data = line.slice(6).trim()
-          if (data === '[DONE]') break
+          
+          // 收到 [DONE] 标记，流式结束
+          if (data === '[DONE]') {
+            aiReply.isStreaming = false
+            break
+          }
 
           try {
             const json = JSON.parse(data)
@@ -114,25 +125,27 @@ const sendMessage = async () => {
               const delta = json.choices[0].delta
               const content = delta?.content || ''
               if (content) {
-                // 更新AI回复内容
                 aiReply.content += content
-                // 强制更新视图
                 messages.value = [...messages.value]
                 scrollToBottom()
               }
             }
           } catch (jsonError) {
             console.error('解析JSON错误:', jsonError)
-            ElMessage.error(`流式响应解析错误: ${jsonError.message}`)
           }
         }
       }
+      
+      // 如果已经标记为非流式，退出循环
+      if (!aiReply.isStreaming) break
     }
   } catch (error) {
     console.error('Error:', error)
     ElMessage.error('获取AI回复失败，请稍后重试')
+    aiReply.isStreaming = false  // 错误时也要停止光标
   } finally {
-    isGenerating.value = false
+    // 确保无论如何光标都会停止
+    aiReply.isStreaming = false
     scrollToBottom()
   }
 }
@@ -159,7 +172,7 @@ onMounted(() => {
         <div v-if="message.role === 'assistant'" class="message-content markdown-wrapper">
           <MarkdownRenderer :content="message.content" />
           <!-- 流式输出时的闪烁光标 -->
-          <span v-if="message.isStreaming" class="streaming-cursor">▊</span>
+          <span v-if="message.isStreaming" class="streaming-cursor"></span>
         </div>
         
         <!-- 用户消息保持纯文本 -->
@@ -316,22 +329,31 @@ onMounted(() => {
 /* Markdown 容器样式 */
 .markdown-wrapper {
   min-width: 200px;
-  max-width: 800px; /* Markdown 内容可以更宽一些 */
+  max-width: 800px;
 }
 
-/* 流式输出闪烁光标 */
+/* 流式输出光标 - 竖线样式，更优雅 */
 .streaming-cursor {
   display: inline-block;
-  color: #0284c7;
-  animation: blink 1s infinite;
+  width: 2px;
+  height: 1.2em;
+  background-color: #0284c7;
   margin-left: 4px;
-  font-size: 14px;
   vertical-align: middle;
+  animation: cursor-blink 1s infinite;
+  border-radius: 1px;
 }
 
-@keyframes blink {
-  0%, 50% { opacity: 1; }
-  51%, 100% { opacity: 0; }
+@keyframes cursor-blink {
+  0%, 45% {
+    opacity: 1;
+  }
+  50%, 95% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
 }
 
 .input-area {
