@@ -1,389 +1,274 @@
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
-import { ChatDotRound, Refresh } from '@element-plus/icons-vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import MarkdownRenderer from '../components/MarkdownRenderer.vue'
+import { useChatStore } from '../stores/chat'
+import { sendChatMessage } from '../api/chat'
 
-// 对话消息列表
-const messages = ref([
-  {
-    id: 1,
-    role: 'assistant',
-    content: '你好！我是你的AI助手，有什么可以帮助你的吗？',
-    timestamp: new Date().toLocaleString(),
-    isStreaming: false
-  }
-])
+// 组件导入
+import SessionSidebar from '../components/SessionSidebar.vue'
+import MessageList from '../components/MessageList.vue'
+import ChatBox from '../components/ChatBox.vue'
 
-// 输入框内容
+const chatStore = useChatStore()
+
+// ==================== 状态管理 ====================
 const inputMessage = ref('')
-
-// 对话区域引用
-const chatContainer = ref(null)
-
-// 是否正在生成回复
 const isGenerating = ref(false)
+const messageListRef = ref(null)
+const chatBoxRef = ref(null)
+
+// ==================== 计算属性 ====================
+const currentSession = computed(() => chatStore.currentSession)
+const currentMessages = computed(() => chatStore.currentMessages)
+
+// ==================== 方法 ====================
+
+// 发送消息
+const sendMessage = async (content) => {
+  if (!content.trim() || isGenerating.value) return
+  
+  // 如果是第一条消息，设置标题
+  const session = chatStore.currentSession
+  if (session && session.title === '新对话') {
+    const title = content.trim().slice(0, 20) + (content.trim().length > 20 ? '...' : '')
+    chatStore.setSessionTitle(session.id, title)
+  }
+  
+  // 添加用户消息
+  chatStore.addMessage({
+    role: 'user',
+    content: content.trim()
+  })
+  
+  // 清空输入框
+  inputMessage.value = ''
+  chatBoxRef.value?.clear()
+  
+  // 开始生成回复
+  await generateAIResponse()
+}
+
+// 生成 AI 回复
+const generateAIResponse = async () => {
+  isGenerating.value = true
+  
+  // 创建 AI 消息占位
+  const aiMessage = chatStore.addMessage({
+    role: 'assistant',
+    content: '',
+    isStreaming: true
+  })
+  
+  // 保存消息ID用于后续操作
+  const messageId = aiMessage.id
+  let hasReceivedContent = false
+  let timeoutId = null
+  
+  // 设置超时保护：如果15秒内没有收到任何数据，自动结束
+  const startTimeout = () => {
+    timeoutId = setTimeout(() => {
+      if (!hasReceivedContent) {
+        console.log('请求超时：15秒内未收到数据')
+        // 标记为完成，触发清理逻辑
+        handleComplete()
+      }
+    }, 15000)
+  }
+  
+  // 清理超时
+  const clearTimeoutGuard = () => {
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+      timeoutId = null
+    }
+  }
+  
+  // 统一的完成处理
+  const handleComplete = () => {
+    clearTimeoutGuard()
+    
+    // 避免重复处理
+    if (!isGenerating.value) return
+    
+    console.log('Stream completed, hasReceivedContent:', hasReceivedContent)
+    
+    // 必须从store获取最新状态
+    const currentMsg = chatStore.currentMessages.find(m => m.id === messageId)
+    const finalContent = currentMsg?.content?.trim() || ''
+    
+    console.log('Final content:', finalContent)
+    
+    // 完成流式输出 - 一定要先停止流式状态
+    chatStore.updateMessage(messageId, { isStreaming: false })
+    isGenerating.value = false
+    
+    // 如果没有收到任何内容，删除空消息
+    if (!hasReceivedContent && finalContent === '') {
+      console.log('No content received, deleting empty message')
+      chatStore.deleteMessage(messageId)
+      ElMessage.warning('AI 未返回内容，可能是 API Key 失效，请检查后重试')
+    }
+  }
+  
+  try {
+    // 获取上下文
+    const context = chatStore.currentContext
+    
+    // 启动超时保护
+    startTimeout()
+    
+    // 发送请求
+    await sendChatMessage({
+      messages: context,
+      onMessage: ({ content }) => {
+        // 收到数据，清除超时
+        if (!hasReceivedContent && content) {
+          clearTimeoutGuard()
+          hasReceivedContent = true
+        }
+        
+        // 更新消息内容 - 使用函数式更新确保获取最新值
+        const currentMsg = chatStore.currentMessages.find(m => m.id === messageId)
+        if (currentMsg) {
+          chatStore.updateMessage(messageId, {
+            content: currentMsg.content + content
+          })
+        }
+        
+        // 滚动到底部
+        nextTick(() => {
+          messageListRef.value?.scrollToBottom()
+        })
+      },
+      onError: (error, isRetry) => {
+        if (!isRetry) {
+          console.error('Chat error:', error)
+        }
+      },
+      onComplete: handleComplete
+    })
+    
+  } catch (error) {
+    console.error('生成回复失败:', error)
+    clearTimeoutGuard()
+    
+    // 出错时停止流式状态
+    chatStore.updateMessage(messageId, { isStreaming: false })
+    isGenerating.value = false
+    
+    // 获取最新消息内容
+    const currentMsg = chatStore.currentMessages.find(m => m.id === messageId)
+    const finalContent = currentMsg?.content?.trim() || ''
+    
+    // 如果是空消息，直接删除
+    if (finalContent === '') {
+      chatStore.deleteMessage(messageId)
+    }
+    
+    ElMessage.error(error.message || '获取回复失败')
+  }
+}
+
+// 处理语音输入结果
+const handleVoiceResult = (text) => {
+  inputMessage.value = text
+}
+
+// 删除消息
+const deleteMessage = (messageId) => {
+  chatStore.deleteMessage(messageId)
+  ElMessage.success('消息已删除')
+}
 
 // 滚动到底部
 const scrollToBottom = () => {
-  nextTick(() => {
-    if (chatContainer.value) {
-      chatContainer.value.scrollTop = chatContainer.value.scrollHeight
-    }
-  })
+  messageListRef.value?.scrollToBottom()
 }
 
-// 发送消息
-const sendMessage = async () => {
-  if (!inputMessage.value.trim() || isGenerating.value) {
-    return
-  }
-
-  // 添加用户消息
-  const userMessage = {
-    id: Date.now(),
-    role: 'user',
-    content: inputMessage.value.trim(),
-    timestamp: new Date().toLocaleString(),
-    isStreaming: false
-  }
-  messages.value.push(userMessage)
-
-  // 清空输入框
-  inputMessage.value = ''
-
-  // 开始生成回复
-  isGenerating.value = true
-
-  // 转换消息格式为OpenAI API所需的格式
-  const apiMessages = messages.value.map(msg => ({
-    role: msg.role,
-    content: msg.content
-  }))
-
-  // 调用后端API
-  const response = await fetch('http://localhost:3000/api/chat', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ 
-      messages: apiMessages
-    })
-  })
-
-  if (!response.ok) {
-    isGenerating.value = false
-    ElMessage.error('API请求失败')
-    return
-  }
-
-  // 处理流式响应
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let aiReply = {
-    id: Date.now() + 1,
-    role: 'assistant',
-    content: '',
-    timestamp: new Date().toLocaleString(),
-    isStreaming: true  // 标记正在流式输出
-  }
-  messages.value.push(aiReply)
-  
-  // 隐藏正在输入指示器
-  isGenerating.value = false
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      
-      // 流式结束：读取完成或没有数据
-      if (done || !value) {
-        aiReply.isStreaming = false
-        break
-      }
-
-      const chunk = decoder.decode(value, { stream: true })
-      const lines = chunk.split('\n')
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim()
-          
-          // 收到 [DONE] 标记，流式结束
-          if (data === '[DONE]') {
-            aiReply.isStreaming = false
-            break
-          }
-
-          try {
-            const json = JSON.parse(data)
-            if (json.error) {
-              throw new Error(json.error)
-            }
-            if (json.choices && json.choices.length > 0) {
-              const delta = json.choices[0].delta
-              const content = delta?.content || ''
-              if (content) {
-                aiReply.content += content
-                messages.value = [...messages.value]
-                scrollToBottom()
-              }
-            }
-          } catch (jsonError) {
-            console.error('解析JSON错误:', jsonError)
-          }
-        }
-      }
-      
-      // 如果已经标记为非流式，退出循环
-      if (!aiReply.isStreaming) break
-    }
-  } catch (error) {
-    console.error('Error:', error)
-    ElMessage.error('获取AI回复失败，请稍后重试')
-    aiReply.isStreaming = false  // 错误时也要停止光标
-  } finally {
-    // 确保无论如何光标都会停止
-    aiReply.isStreaming = false
-    scrollToBottom()
-  }
-}
-
-// 组件挂载后滚动到底部
+// ==================== 生命周期 ====================
 onMounted(() => {
-  scrollToBottom()
+  // 加载会话数据
+  chatStore.loadFromStorage()
+  
+  // 滚动到底部
+  nextTick(() => {
+    scrollToBottom()
+  })
 })
 </script>
 
 <template>
-  <div class="chat-container">
-    <!-- 聊天区域 -->
-    <div class="chat-messages" ref="chatContainer">
-      <div
-        v-for="(message, index) in messages"
-        :key="index"
-        :class="[
-          'message-item',
-          message.role === 'assistant' ? 'ai-message' : 'user-message'
-        ]"
-      >
-        <!-- AI 消息使用 Markdown 渲染 -->
-        <div v-if="message.role === 'assistant'" class="message-content markdown-wrapper">
-          <MarkdownRenderer :content="message.content" />
-          <!-- 流式输出时的闪烁光标 -->
-          <span v-if="message.isStreaming" class="streaming-cursor"></span>
-        </div>
-        
-        <!-- 用户消息保持纯文本 -->
-        <div v-else class="message-content">
-          {{ message.content }}
-        </div>
-      </div>
-      
-      <!-- 正在输入指示器 -->
-      <div v-if="isGenerating" class="message-item ai-message">
-        <div class="message-content generating">
-          <div class="typing-indicator">
-            <div class="typing-dot"></div>
-            <div class="typing-dot"></div>
-            <div class="typing-dot"></div>
-          </div>
-          <span class="typing-text">正在思考...</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- 输入区域 -->
-    <div class="input-area">
-      <el-input
-        v-model="inputMessage"
-        placeholder="请输入消息..."
-        @keyup.enter="sendMessage"
-        :disabled="isGenerating"
-        type="textarea"
-        :rows="3"
-        resize="none"
+  <div class="ai-view">
+    <!-- 侧边栏：会话列表 -->
+    <SessionSidebar class="sidebar" />
+    
+    <!-- 主聊天区域 -->
+    <div class="chat-container">
+      <!-- 消息列表 -->
+      <MessageList
+        ref="messageListRef"
+        :messages="currentMessages"
+        :is-generating="isGenerating"
+        @delete-message="deleteMessage"
       />
-      <el-button
-        type="primary"
-        @click="sendMessage"
-        :disabled="isGenerating || !inputMessage.trim()"
-        :icon="isGenerating ? Refresh : ChatDotRound"
-        :loading="isGenerating"
-      >
-        {{ isGenerating ? '生成中...' : '发送' }}
-      </el-button>
+      
+      <!-- 输入区域 -->
+      <div class="input-area">
+        <ChatBox
+          ref="chatBoxRef"
+          v-model="inputMessage"
+          :loading="isGenerating"
+          :disabled="isGenerating"
+          placeholder="请输入消息...（Shift+Enter换行，Enter发送）"
+          loading-text="生成中..."
+          tips-text="Enter 发送 · Shift+Enter 换行 · 支持语音输入"
+          @send="sendMessage"
+          @voice-result="handleVoiceResult"
+        >
+          <!-- 自定义额外操作 -->
+          <template #actions="{ loading, disabled }">
+            <el-button
+              type="primary"
+              :disabled="disabled || !inputMessage.trim()"
+              :loading="loading"
+              class="send-btn"
+              @click="sendMessage(inputMessage)"
+            >
+              {{ loading ? '生成中...' : '发送' }}
+            </el-button>
+          </template>
+        </ChatBox>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+.ai-view {
+  display: flex;
+  height: 100vh;
+  background-color: #fff;
+}
+
+.sidebar {
+  flex-shrink: 0;
+}
+
 .chat-container {
+  flex: 1;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   height: 100%;
-  background-color: #f5f5f5;
-}
-
-.chat-messages {
-  flex: 1;
-  overflow-y: auto;
-  padding: 20px;
-  background-color: #fafafa;
-}
-
-.message-item {
-  margin-bottom: 20px;
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  animation: fadeIn 0.3s ease-in;
-}
-
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* 正在输入指示器样式 */
-.generating {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.typing-indicator {
-  display: flex;
-  gap: 4px;
-  padding-top: 2px;
-}
-
-.typing-dot {
-  width: 8px;
-  height: 8px;
-  background-color: #0284c7;
-  border-radius: 50%;
-  animation: typing 1.4s infinite ease-in-out;
-}
-
-.typing-dot:nth-child(2) {
-  animation-delay: 0.2s;
-}
-
-.typing-dot:nth-child(3) {
-  animation-delay: 0.4s;
-}
-
-.typing-text {
-  color: #666;
-  font-style: italic;
-}
-
-@keyframes typing {
-  0%, 60%, 100% {
-    transform: translateY(0);
-    opacity: 0.5;
-  }
-  30% {
-    transform: translateY(-10px);
-    opacity: 1;
-  }
-}
-
-.ai-message {
-  justify-content: flex-start;
-}
-
-.user-message {
-  justify-content: flex-end;
-}
-
-.message-content {
-  max-width: 70%;
-  padding: 14px 18px;
-  border-radius: 18px;
-  font-size: 15px;
-  line-height: 1.5;
-  word-wrap: break-word;
-}
-
-.ai-message .message-content {
-  background-color: #fff;
-  border: 1px solid #e8e8e8;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
-}
-
-.user-message .message-content {
-  background-color: #0284c7;
-  color: white;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
-}
-
-/* Markdown 容器样式 */
-.markdown-wrapper {
-  min-width: 200px;
-  max-width: 800px;
-}
-
-/* 流式输出光标 - 竖线样式，更优雅 */
-.streaming-cursor {
-  display: inline-block;
-  width: 2px;
-  height: 1.2em;
-  background-color: #0284c7;
-  margin-left: 4px;
-  vertical-align: middle;
-  animation: cursor-blink 1s infinite;
-  border-radius: 1px;
-}
-
-@keyframes cursor-blink {
-  0%, 45% {
-    opacity: 1;
-  }
-  50%, 95% {
-    opacity: 0;
-  }
-  100% {
-    opacity: 1;
-  }
 }
 
 .input-area {
-  padding: 20px;
+  padding: 16px 20px 20px;
   background-color: #fff;
   border-top: 1px solid #e8e8e8;
 }
 
-.input-area :deep(.el-textarea__inner) {
-  border-radius: 12px;
-  border-color: #e8e8e8;
-  resize: none;
-  font-size: 15px;
-}
-
-.input-area :deep(.el-button) {
-  margin-top: 12px;
-  border-radius: 12px;
-  padding: 8px 24px;
-  font-size: 15px;
-  background-color: #0284c7;
-  border: none;
-}
-
-.input-area :deep(.el-button:hover) {
-  background-color: #0ea5e9;
-}
-
-.input-area :deep(.el-button.is-disabled) {
-  background-color: #93c5fd;
-  cursor: not-allowed;
+.send-btn {
+  min-width: 100px;
 }
 </style>
